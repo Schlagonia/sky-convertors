@@ -1,70 +1,63 @@
+// SPDX-License-Identifier: AGPL-3.0
 pragma solidity ^0.8.18;
 
-import "forge-std/console2.sol";
-import {Setup, ERC20, IStrategyInterface} from "./utils/Setup.sol";
+import {USDCToUSDS} from "../USDCToUSDS.sol";
+import {IStrategyInterface} from "../interfaces/IStrategyInterface.sol";
+import {Setup} from "./utils/Setup.sol";
 
 contract ShutdownTest is Setup {
-    function setUp() public virtual override {
-        super.setUp();
+    function setUpStrategy() public override returns (IStrategyInterface) {
+        return IStrategyInterface(address(new USDCToUSDS(SUSDS, "USDC to USDS")));
     }
 
-    function test_shutdownCanWithdraw(uint256 _amount) public {
-        vm.assume(_amount > minFuzzAmount && _amount < maxFuzzAmount);
+    function test_shutdownCanWithdraw(uint256 amount) public {
+        amount = _boundAmount(amount);
 
-        // Deposit into strategy
-        mintAndDepositIntoStrategy(strategy, user, _amount);
+        mintAndDepositIntoStrategy(strategy, user, amount);
+        assertGe(strategy.totalAssets(), amount, "!totalAssets");
 
-        assertEq(strategy.totalAssets(), _amount, "!totalAssets");
-
-        // Earn Interest
         skip(1 days);
+        uint256 assets = strategy.totalAssets();
 
-        // Shutdown the strategy
         vm.prank(emergencyAdmin);
         strategy.shutdownStrategy();
 
-        assertEq(strategy.totalAssets(), _amount, "!totalAssets");
+        assertApproxEqAbs(strategy.totalAssets(), assets, 1, "!totalAssets");
 
-        // Make sure we can still withdraw the full amount
         uint256 balanceBefore = asset.balanceOf(user);
+        uint256 shares = strategy.balanceOf(user);
+        uint256 expected = strategy.previewRedeem(shares);
 
-        // Withdraw all funds
         vm.prank(user);
-        strategy.redeem(_amount, user, user);
+        strategy.redeem(shares, user, user, MAX_BPS);
 
-        assertGe(asset.balanceOf(user), balanceBefore + _amount, "!final balance");
+        assertApproxEqAbs(asset.balanceOf(user), balanceBefore + expected, 1, "!final balance");
     }
 
-    function test_emergencyWithdraw_maxUint(uint256 _amount) public {
-        vm.assume(_amount > minFuzzAmount && _amount < maxFuzzAmount);
+    function test_emergencyWithdrawMaxUint(uint256 amount) public {
+        amount = _boundAmount(amount);
 
-        // Deposit into strategy
-        mintAndDepositIntoStrategy(strategy, user, _amount);
+        mintAndDepositIntoStrategy(strategy, user, amount);
+        assertGe(strategy.totalAssets(), amount, "!totalAssets");
 
-        assertEq(strategy.totalAssets(), _amount, "!totalAssets");
-
-        // Earn Interest
         skip(1 days);
+        uint256 assets = strategy.totalAssets();
 
-        // Shutdown the strategy
         vm.prank(emergencyAdmin);
         strategy.shutdownStrategy();
 
-        assertEq(strategy.totalAssets(), _amount, "!totalAssets");
+        assertApproxEqAbs(strategy.totalAssets(), assets, 1, "!totalAssets");
 
-        // should be able to pass uint 256 max and not revert.
         vm.prank(emergencyAdmin);
         strategy.emergencyWithdraw(type(uint256).max);
 
-        // Make sure we can still withdraw the full amount
         uint256 balanceBefore = asset.balanceOf(user);
+        uint256 shares = strategy.balanceOf(user);
+        uint256 expected = strategy.previewRedeem(shares);
 
-        // Withdraw all funds
         vm.prank(user);
-        strategy.redeem(_amount, user, user);
+        strategy.redeem(shares, user, user, MAX_BPS);
 
-        assertGe(asset.balanceOf(user), balanceBefore + _amount, "!final balance");
+        assertApproxEqAbs(asset.balanceOf(user), balanceBefore + expected, 1, "!final balance");
     }
-
-    // TODO: Add tests for any emergency function added.
 }

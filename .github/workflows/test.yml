@@ -27,10 +27,12 @@ jobs:
       - name: Run Forge build
         run: |
           forge --version
-          forge build --sizes
+          forge build src --sizes
         id: build
 
       - name: Run Forge tests
+        env:
+          ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
         run: |
-          forge test -vvv --fork-url ${{ secrets.ETH_RPC_URL }}
+          forge test -vvv
         id: test

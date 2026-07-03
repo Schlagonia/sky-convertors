@@ -1,173 +1,273 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: AGPL-3.0
 pragma solidity ^0.8.18;
 
-import "forge-std/console2.sol";
-import {Setup, ERC20, IStrategyInterface} from "./utils/Setup.sol";
+import {Setup, IHealthCheck, IStrategyInterface} from "./utils/Setup.sol";
 
-contract OperationTest is Setup {
-    function setUp() public virtual override {
-        super.setUp();
-    }
+import {DAIToUSDC} from "../DAIToUSDC.sol";
+import {USDCToSUSDS} from "../USDCToSUSDS.sol";
+import {USDCToUSDS} from "../USDCToUSDS.sol";
+import {USDSToUSDC} from "../USDSToUSDC.sol";
+import {IPSM, ISUSDS} from "../interfaces/ISky.sol";
 
+abstract contract ConverterBehaviorTest is Setup {
     function test_setupStrategyOK() public {
-        console2.log("address of strategy", address(strategy));
-        assertTrue(address(0) != address(strategy));
+        assertTrue(address(strategy) != address(0));
         assertEq(strategy.asset(), address(asset));
         assertEq(strategy.management(), management);
         assertEq(strategy.performanceFeeRecipient(), performanceFeeRecipient);
         assertEq(strategy.keeper(), keeper);
-        // TODO: add additional check on strat params
+        assertEq(strategy.emergencyAdmin(), emergencyAdmin);
+        assertEq(strategy.apiVersion(), "3.1.0");
+        assertEq(strategy.totalAssets(), 0);
+        assertEq(strategy.strategyTotalAssets(), 0);
+        assertTrue(!IHealthCheck(address(strategy)).open());
+        assertEq(IHealthCheck(address(strategy)).lossLimitRatio(), 0);
     }
 
-    function test_operation(uint256 _amount) public {
-        vm.assume(_amount > minFuzzAmount && _amount < maxFuzzAmount);
+    function test_depositWithdraw(uint256 amount) public {
+        amount = _boundAmount(amount);
 
-        // Deposit into strategy
-        mintAndDepositIntoStrategy(strategy, user, _amount);
+        mintAndDepositIntoStrategy(strategy, user, amount);
 
-        assertEq(strategy.totalAssets(), _amount, "!totalAssets");
+        assertGe(strategy.totalAssets(), amount, "!totalAssets");
+        assertGe(strategy.lastTotalAssets(), amount, "!lastTotalAssets");
+        assertEq(asset.balanceOf(user), 0, "!userSpent");
 
-        // Earn Interest
         skip(1 days);
 
-        // Report profit
+        // The vault's maxRedeem can lag totalAssets by unreported profit,
+        // so a full exit is not always possible in a single redeem.
+        uint256 shares = strategy.maxRedeem(user);
+        assertGt(shares, 0, "!shares");
+        uint256 expected = strategy.previewRedeem(shares);
+        vm.prank(user);
+        uint256 withdrawn = strategy.redeem(shares, user, user, MAX_BPS);
+
+        assertApproxEqAbs(withdrawn, expected, 1, "!withdrawn");
+        assertEq(asset.balanceOf(user), withdrawn, "!assetOut");
+        assertGe(withdrawn, amount - (amount / 1000), "!fullValue");
+        assertLe(strategy.totalAssets(), amount / 1000 + 2, "!residual");
+    }
+
+    function test_depositLimitZeroWhenPsmTinFeeOn() public {
+        assertGt(strategy.availableDepositLimit(user), 0, "!depositLimit");
+
+        vm.mockCall(PSM, abi.encodeWithSelector(IPSM.tin.selector), abi.encode(1));
+
+        assertEq(strategy.availableDepositLimit(user), 0, "!feeDepositLimit");
+    }
+
+    function test_depositLimitZeroWhenPsmToutFeeOn() public {
+        assertGt(strategy.availableDepositLimit(user), 0, "!depositLimit");
+
+        vm.mockCall(PSM, abi.encodeWithSelector(IPSM.tout.selector), abi.encode(1));
+
+        assertEq(strategy.availableDepositLimit(user), 0, "!feeDepositLimit");
+    }
+
+    function test_liveAccountingWithoutReport(uint256 amount, uint16 profitBps) public {
+        amount = _boundAmount(amount);
+        profitBps = uint16(bound(uint256(profitBps), 1, 1_000));
+
+        mintAndDepositIntoStrategy(strategy, user, amount);
+
+        uint256 baseline = strategy.totalAssets();
+        uint256 lastTotalAssets = strategy.lastTotalAssets();
+        uint256 requestedProfit = (amount * profitBps) / MAX_BPS;
+        uint256 actualProfit = accrueYield(requestedProfit);
+
+        skip(1);
+
+        uint256 liveAssets = strategy.totalAssets();
+        assertGe(liveAssets, baseline + actualProfit, "!liveAssets");
+        assertEq(strategy.lastTotalAssets(), lastTotalAssets, "!noWriteSync");
+
+        uint256 shares = strategy.maxRedeem(user);
+        assertGt(shares, 0, "!shares");
+        uint256 expected = strategy.previewRedeem(shares);
+        vm.prank(user);
+        uint256 withdrawn = strategy.redeem(shares, user, user, MAX_BPS);
+
+        assertApproxEqAbs(withdrawn, expected, 1, "!withdrawnWithProfit");
+        assertEq(asset.balanceOf(user), withdrawn, "!profitOut");
+    }
+
+    function test_reportIsNoopAfterLiveAccrual(uint256 amount, uint16 profitBps) public {
+        amount = _boundAmount(amount);
+        profitBps = uint16(bound(uint256(profitBps), 1, 1_000));
+
+        mintAndDepositIntoStrategy(strategy, user, amount);
+
+        accrueYield((amount * profitBps) / MAX_BPS);
+        skip(1);
+
+        uint256 liveAssets = strategy.totalAssets();
+        assertGe(liveAssets, amount, "!liveAssets");
+
         vm.prank(keeper);
         (uint256 profit, uint256 loss) = strategy.report();
 
-        // Check return Values
-        assertGe(profit, 0, "!profit");
-        assertEq(loss, 0, "!loss");
-
-        skip(strategy.profitMaxUnlockTime());
-
-        uint256 balanceBefore = asset.balanceOf(user);
-
-        // Withdraw all funds
-        vm.prank(user);
-        strategy.redeem(_amount, user, user);
-
-        assertGe(asset.balanceOf(user), balanceBefore + _amount, "!final balance");
+        assertEq(profit, 0, "!reportProfit");
+        assertEq(loss, 0, "!reportLoss");
+        assertApproxEqAbs(strategy.lastTotalAssets(), liveAssets, 1, "!synced");
     }
 
-    function test_profitableReport(uint256 _amount, uint16 _profitFactor) public {
-        vm.assume(_amount > minFuzzAmount && _amount < maxFuzzAmount);
-        _profitFactor = uint16(bound(uint256(_profitFactor), 10, MAX_BPS));
+    function test_shutdownAndEmergencyWithdraw(uint256 amount) public {
+        amount = _boundAmount(amount);
 
-        // Deposit into strategy
-        mintAndDepositIntoStrategy(strategy, user, _amount);
+        mintAndDepositIntoStrategy(strategy, user, amount);
+        uint256 assets = strategy.totalAssets();
 
-        assertEq(strategy.totalAssets(), _amount, "!totalAssets");
+        vm.prank(emergencyAdmin);
+        strategy.shutdownStrategy();
 
-        // Earn Interest
-        skip(1 days);
+        vm.prank(emergencyAdmin);
+        strategy.emergencyWithdraw(type(uint256).max);
 
-        // TODO: implement logic to simulate earning interest.
-        uint256 toAirdrop = (_amount * _profitFactor) / MAX_BPS;
-        airdrop(asset, address(strategy), toAirdrop);
+        assertApproxEqAbs(strategy.totalAssets(), assets, 1, "!assetsAfterEmergency");
 
-        // Report profit
-        vm.prank(keeper);
-        (uint256 profit, uint256 loss) = strategy.report();
-
-        // Check return Values
-        assertGe(profit, toAirdrop, "!profit");
-        assertEq(loss, 0, "!loss");
-
-        skip(strategy.profitMaxUnlockTime());
-
-        uint256 balanceBefore = asset.balanceOf(user);
-
-        // Withdraw all funds
+        uint256 shares = strategy.maxRedeem(user);
+        assertGt(shares, 0, "!shares");
+        uint256 expected = strategy.previewRedeem(shares);
         vm.prank(user);
-        strategy.redeem(_amount, user, user);
+        uint256 withdrawn = strategy.redeem(shares, user, user, MAX_BPS);
 
-        assertGe(asset.balanceOf(user), balanceBefore + _amount, "!final balance");
+        assertApproxEqAbs(withdrawn, expected, 1, "!withdrawn");
+        assertEq(asset.balanceOf(user), withdrawn, "!assetOut");
     }
 
-    function test_profitableReport_withFees(uint256 _amount, uint16 _profitFactor) public {
-        vm.assume(_amount > minFuzzAmount && _amount < maxFuzzAmount);
-        _profitFactor = uint16(bound(uint256(_profitFactor), 10, MAX_BPS));
-
-        // Set protocol fee to 0 and perf fee to 10%
-        setFees(0, 1_000);
-
-        // Deposit into strategy
-        mintAndDepositIntoStrategy(strategy, user, _amount);
-
-        assertEq(strategy.totalAssets(), _amount, "!totalAssets");
-
-        // Earn Interest
-        skip(1 days);
-
-        // TODO: implement logic to simulate earning interest.
-        uint256 toAirdrop = (_amount * _profitFactor) / MAX_BPS;
-        airdrop(asset, address(strategy), toAirdrop);
-
-        // Report profit
-        vm.prank(keeper);
-        (uint256 profit, uint256 loss) = strategy.report();
-
-        // Check return Values
-        assertGe(profit, toAirdrop, "!profit");
-        assertEq(loss, 0, "!loss");
-
-        skip(strategy.profitMaxUnlockTime());
-
-        // Get the expected fee
-        uint256 expectedShares = (profit * 1_000) / MAX_BPS;
-
-        assertEq(strategy.balanceOf(performanceFeeRecipient), expectedShares);
-
-        uint256 balanceBefore = asset.balanceOf(user);
-
-        // Withdraw all funds
-        vm.prank(user);
-        strategy.redeem(_amount, user, user);
-
-        assertGe(asset.balanceOf(user), balanceBefore + _amount, "!final balance");
-
-        vm.prank(performanceFeeRecipient);
-        strategy.redeem(expectedShares, performanceFeeRecipient, performanceFeeRecipient);
-
-        checkStrategyTotals(strategy, 0, 0, 0);
-
-        assertGe(asset.balanceOf(performanceFeeRecipient), expectedShares, "!perf fee out");
-    }
-
-    function test_tendTrigger(uint256 _amount) public {
-        vm.assume(_amount > minFuzzAmount && _amount < maxFuzzAmount);
+    function test_tendTriggerFalse(uint256 amount) public {
+        amount = _boundAmount(amount);
 
         (bool trigger,) = strategy.tendTrigger();
         assertTrue(!trigger);
 
-        // Deposit into strategy
-        mintAndDepositIntoStrategy(strategy, user, _amount);
+        mintAndDepositIntoStrategy(strategy, user, amount);
 
         (trigger,) = strategy.tendTrigger();
         assertTrue(!trigger);
+    }
+}
 
-        // Skip some time
+contract USDCToUSDSTest is ConverterBehaviorTest {
+    function setUpStrategy() public override returns (IStrategyInterface) {
+        return IStrategyInterface(address(new USDCToUSDS(SUSDS, "USDC to USDS")));
+    }
+
+    function accrueYield(uint256 amount) public override returns (uint256) {
+        amount;
+        uint256 beforeAssets = strategy.totalAssets();
         skip(1 days);
+        uint256 afterAssets = strategy.totalAssets();
+        return afterAssets > beforeAssets ? afterAssets - beforeAssets : 0;
+    }
 
-        (trigger,) = strategy.tendTrigger();
-        assertTrue(!trigger);
+    function test_depositsConvertedFundsIntoVault() public {
+        mintAndDepositIntoStrategy(strategy, user, 1_000e6);
 
-        vm.prank(keeper);
-        strategy.report();
+        assertGt(vault.balanceOf(address(strategy)), 0, "!vaultShares");
+        assertLt(usds.balanceOf(address(strategy)), SCALE, "!looseUsds");
+    }
+}
 
-        (trigger,) = strategy.tendTrigger();
-        assertTrue(!trigger);
+contract USDSToUSDCTest is ConverterBehaviorTest {
+    function setUpStrategy() public override returns (IStrategyInterface) {
+        return IStrategyInterface(address(new USDSToUSDC(USDC_VAULT, "USDS to USDC")));
+    }
 
-        // Unlock Profits
-        skip(strategy.profitMaxUnlockTime());
+    function accrueYield(uint256 amount) public override returns (uint256) {
+        uint256 beforeAssets = strategy.totalAssets();
+        uint256 gemAmount = amount / SCALE;
+        if (gemAmount == 0) gemAmount = 1;
+        deal(USDC, address(this), gemAmount);
+        usdc.approve(address(usdcVault), gemAmount);
+        usdcVault.deposit(gemAmount, address(strategy));
+        uint256 afterAssets = strategy.totalAssets();
+        return afterAssets > beforeAssets ? afterAssets - beforeAssets : 0;
+    }
 
-        (trigger,) = strategy.tendTrigger();
-        assertTrue(!trigger);
+    function test_depositsConvertedFundsIntoVault() public {
+        mintAndDepositIntoStrategy(strategy, user, 1_000e18);
 
+        assertGt(usdcVault.balanceOf(address(strategy)), 0, "!vaultShares");
+        assertEq(usdc.balanceOf(address(strategy)), 0, "!looseUsdc");
+    }
+}
+
+contract DAIToUSDCTest is ConverterBehaviorTest {
+    function setUpStrategy() public override returns (IStrategyInterface) {
+        return IStrategyInterface(address(new DAIToUSDC(USDC_VAULT, "DAI to USDC")));
+    }
+
+    function accrueYield(uint256 amount) public override returns (uint256) {
+        uint256 beforeAssets = strategy.totalAssets();
+        uint256 gemAmount = amount / SCALE;
+        if (gemAmount == 0) gemAmount = 1;
+        deal(USDC, address(this), gemAmount);
+        usdc.approve(address(usdcVault), gemAmount);
+        usdcVault.deposit(gemAmount, address(strategy));
+        uint256 afterAssets = strategy.totalAssets();
+        return afterAssets > beforeAssets ? afterAssets - beforeAssets : 0;
+    }
+
+    function test_depositsConvertedFundsIntoVault() public {
+        mintAndDepositIntoStrategy(strategy, user, 1_000e18);
+
+        assertGt(usdcVault.balanceOf(address(strategy)), 0, "!vaultShares");
+        assertEq(usdc.balanceOf(address(strategy)), 0, "!looseUsdc");
+    }
+}
+
+contract USDCToSUSDSTest is ConverterBehaviorTest {
+    function setUpStrategy() public override returns (IStrategyInterface) {
+        return IStrategyInterface(address(new USDCToSUSDS(SUSDS, "USDC to sUSDS")));
+    }
+
+    function accrueYield(uint256 amount) public override returns (uint256) {
+        amount;
+        uint256 beforeAssets = strategy.totalAssets();
+        skip(1 days);
+        uint256 afterAssets = strategy.totalAssets();
+        return afterAssets > beforeAssets ? afterAssets - beforeAssets : 0;
+    }
+
+    function test_depositsConvertedFundsIntoVault() public {
+        mintAndDepositIntoStrategy(strategy, user, 1_000e6);
+
+        assertGt(vault.balanceOf(address(strategy)), 0, "!vaultShares");
+        assertLt(usds.balanceOf(address(strategy)), SCALE, "!looseUsds");
+    }
+
+    function test_susdsReferralDeposit() public {
+        uint256 amount = 1_000e6;
+        vm.expectCall(
+            SUSDS,
+            abi.encodeWithSelector(
+                ISUSDS.deposit.selector,
+                amount * SCALE,
+                address(strategy),
+                USDCToSUSDS(address(strategy)).referralCode()
+            )
+        );
+        mintAndDepositIntoStrategy(strategy, user, amount);
+    }
+
+    function test_setReferralCode() public {
+        USDCToSUSDS susdsStrategy = USDCToSUSDS(address(strategy));
+        assertEq(susdsStrategy.referralCode(), 1007, "!default");
+
+        vm.expectRevert("!management");
         vm.prank(user);
-        strategy.redeem(_amount, user, user);
+        susdsStrategy.setReferralCode(42);
 
-        (trigger,) = strategy.tendTrigger();
-        assertTrue(!trigger);
+        vm.prank(management);
+        susdsStrategy.setReferralCode(42);
+        assertEq(susdsStrategy.referralCode(), 42, "!set");
+
+        uint256 amount = 1_000e6;
+        vm.expectCall(
+            SUSDS, abi.encodeWithSelector(ISUSDS.deposit.selector, amount * SCALE, address(strategy), uint16(42))
+        );
+        mintAndDepositIntoStrategy(strategy, user, amount);
     }
 }

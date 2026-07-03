@@ -1,89 +1,90 @@
 // SPDX-License-Identifier: AGPL-3.0
 pragma solidity ^0.8.18;
 
-import "forge-std/console2.sol";
 import {Test} from "forge-std/Test.sol";
 
-import {Strategy, ERC20} from "../../Strategy.sol";
-import {StrategyFactory} from "../../StrategyFactory.sol";
-import {IStrategyInterface} from "../../interfaces/IStrategyInterface.sol";
-
-// Inherit the events so they can be checked if desired.
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IEvents} from "@tokenized-strategy/interfaces/IEvents.sol";
 
-interface IFactory {
-    function governance() external view returns (address);
+import {IStrategyInterface} from "../../interfaces/IStrategyInterface.sol";
 
-    function set_protocol_fee_bps(uint16) external;
-
-    function set_protocol_fee_recipient(address) external;
+interface IHealthCheck {
+    function open() external view returns (bool);
+    function lossLimitRatio() external view returns (uint256);
+    function setAllowed(address _depositor, bool _allowed) external;
 }
 
-contract Setup is Test, IEvents {
-    // Contract instances that we will use repeatedly.
+abstract contract Setup is Test, IEvents {
+    uint256 public constant MAX_BPS = 10_000;
+    uint256 public constant SCALE = 1e12;
+    address public constant TOKENIZED_STRATEGY = 0x310f5Db015E9d6E542fd41bd4542640790791e76;
+    address public constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address public constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address public constant USDS = 0xdC035D45d973E3EC169d2276DDab16f1e407384F;
+    address public constant SUSDS = 0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD;
+    address public constant USDC_VAULT = 0x696d02Db93291651ED510704c9b286841d506987;
+    address public constant DAI_USDS = 0x3225737a9Bbb6473CB4a45b7244ACa2BeFdB276A;
+    address public constant PSM = 0xf6e72Db5454dd049d0788e411b06CfAF16853042;
+    address public constant LITE_PSM_WRAPPER = 0xA188EEC8F81263234dA3622A406892F3D630f98c;
+
+    ERC20 public usdc;
+    ERC20 public usds;
+    ERC20 public dai;
+    IERC4626 public vault;
+    IERC4626 public usdcVault;
+
     ERC20 public asset;
     IStrategyInterface public strategy;
 
-    StrategyFactory public strategyFactory;
-
-    mapping(string => address) public tokenAddrs;
-
-    // Addresses for different roles we will use repeatedly.
     address public user = address(10);
     address public keeper = address(4);
     address public management = address(1);
     address public performanceFeeRecipient = address(3);
     address public emergencyAdmin = address(5);
 
-    // Address of the real deployed Factory
-    address public factory;
-
-    // Integer variables that will be used repeatedly.
     uint256 public decimals;
-    uint256 public MAX_BPS = 10_000;
-
-    // Fuzz from $0.01 of 1e6 stable coins up to 1 trillion of a 1e18 coin
-    uint256 public maxFuzzAmount = 1e30;
-    uint256 public minFuzzAmount = 10_000;
-
-    // Default profit max unlock time is set for 10 days
-    uint256 public profitMaxUnlockTime = 10 days;
+    uint256 public minFuzzAmount;
+    uint256 public maxFuzzAmount;
 
     function setUp() public virtual {
-        _setTokenAddrs();
+        vm.createSelectFork(vm.envString("ETH_RPC_URL"));
 
-        // Set asset
-        asset = ERC20(tokenAddrs["DAI"]);
+        usdc = ERC20(USDC);
+        usds = ERC20(USDS);
+        dai = ERC20(DAI);
+        vault = IERC4626(SUSDS);
+        usdcVault = IERC4626(USDC_VAULT);
+        require(usdcVault.asset() == USDC, "!usdc vault asset");
 
-        // Set decimals
+        strategy = setUpStrategy();
+        asset = ERC20(strategy.asset());
         decimals = asset.decimals();
+        minFuzzAmount = 10 ** decimals;
+        maxFuzzAmount = 100_000 * 10 ** decimals;
 
-        strategyFactory = new StrategyFactory(management, performanceFeeRecipient, keeper, emergencyAdmin);
+        _configureRoles(strategy);
 
-        // Deploy strategy and set variables
-        strategy = IStrategyInterface(setUpStrategy());
+        vm.prank(management);
+        strategy.acceptManagement();
 
-        factory = strategy.FACTORY();
+        vm.prank(management);
+        IHealthCheck(address(strategy)).setAllowed(user, true);
 
-        // label all the used addresses for traces
+        vm.prank(management);
+        strategy.setPerformanceFee(0);
+
+        vm.label(user, "user");
         vm.label(keeper, "keeper");
-        vm.label(factory, "factory");
         vm.label(address(asset), "asset");
         vm.label(management, "management");
         vm.label(address(strategy), "strategy");
         vm.label(performanceFeeRecipient, "performanceFeeRecipient");
+        vm.label(SUSDS, "susds");
+        vm.label(USDC_VAULT, "usdcVault");
     }
 
-    function setUpStrategy() public returns (address) {
-        // we save the strategy as a IStrategyInterface to give it the needed interface
-        IStrategyInterface _strategy =
-            IStrategyInterface(address(strategyFactory.newStrategy(address(asset), "Tokenized Strategy")));
-
-        vm.prank(management);
-        _strategy.acceptManagement();
-
-        return address(_strategy);
-    }
+    function setUpStrategy() public virtual returns (IStrategyInterface);
 
     function depositIntoStrategy(IStrategyInterface _strategy, address _user, uint256 _amount) public {
         vm.prank(_user);
@@ -98,49 +99,39 @@ contract Setup is Test, IEvents {
         depositIntoStrategy(_strategy, _user, _amount);
     }
 
-    // For checking the amounts in the strategy
     function checkStrategyTotals(
         IStrategyInterface _strategy,
         uint256 _totalAssets,
         uint256 _totalDebt,
         uint256 _totalIdle
     ) public {
-        uint256 _assets = _strategy.totalAssets();
-        uint256 _balance = ERC20(_strategy.asset()).balanceOf(address(_strategy));
-        uint256 _idle = _balance > _assets ? _assets : _balance;
-        uint256 _debt = _assets - _idle;
-        assertEq(_assets, _totalAssets, "!totalAssets");
-        assertEq(_debt, _totalDebt, "!totalDebt");
-        assertEq(_idle, _totalIdle, "!totalIdle");
+        uint256 assets_ = _strategy.totalAssets();
+        uint256 balance = ERC20(_strategy.asset()).balanceOf(address(_strategy));
+        uint256 idle = balance > assets_ ? assets_ : balance;
+        uint256 debt = assets_ - idle;
+        assertEq(assets_, _totalAssets, "!totalAssets");
+        assertEq(debt, _totalDebt, "!totalDebt");
+        assertEq(idle, _totalIdle, "!totalIdle");
         assertEq(_totalAssets, _totalDebt + _totalIdle, "!Added");
     }
 
     function airdrop(ERC20 _asset, address _to, uint256 _amount) public {
-        uint256 balanceBefore = _asset.balanceOf(_to);
-        deal(address(_asset), _to, balanceBefore + _amount);
+        deal(address(_asset), _to, _amount);
     }
 
-    function setFees(uint16 _protocolFee, uint16 _performanceFee) public {
-        address gov = IFactory(factory).governance();
-
-        // Need to make sure there is a protocol fee recipient to set the fee.
-        vm.prank(gov);
-        IFactory(factory).set_protocol_fee_recipient(gov);
-
-        vm.prank(gov);
-        IFactory(factory).set_protocol_fee_bps(_protocolFee);
-
-        vm.prank(management);
-        strategy.setPerformanceFee(_performanceFee);
+    function accrueYield(uint256 _amount) public virtual returns (uint256) {
+        _amount;
+        return 0;
     }
 
-    function _setTokenAddrs() internal {
-        tokenAddrs["WBTC"] = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
-        tokenAddrs["YFI"] = 0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e;
-        tokenAddrs["WETH"] = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-        tokenAddrs["LINK"] = 0x514910771AF9Ca656af840dff83E8264EcF986CA;
-        tokenAddrs["USDT"] = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-        tokenAddrs["DAI"] = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
-        tokenAddrs["USDC"] = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    function _configureRoles(IStrategyInterface _strategy) internal {
+        _strategy.setPerformanceFeeRecipient(performanceFeeRecipient);
+        _strategy.setKeeper(keeper);
+        _strategy.setEmergencyAdmin(emergencyAdmin);
+        _strategy.setPendingManagement(management);
+    }
+
+    function _boundAmount(uint256 _amount) internal view returns (uint256) {
+        return bound(_amount, minFuzzAmount, maxFuzzAmount);
     }
 }
