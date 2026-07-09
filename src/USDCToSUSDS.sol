@@ -5,7 +5,7 @@ import {USDCToUSDS} from "./USDCToUSDS.sol";
 import {ISUSDS} from "./interfaces/ISky.sol";
 
 contract USDCToSUSDS is USDCToUSDS {
-    uint16 public referralCode = 1007;
+    uint16 public referralCode = 224;
 
     constructor(address _vault, string memory _name) USDCToUSDS(_vault, _name) {}
 

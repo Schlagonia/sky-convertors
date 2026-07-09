@@ -254,7 +254,7 @@ contract USDCToSUSDSTest is ConverterBehaviorTest {
 
     function test_setReferralCode() public {
         USDCToSUSDS susdsStrategy = USDCToSUSDS(address(strategy));
-        assertEq(susdsStrategy.referralCode(), 1007, "!default");
+        assertEq(susdsStrategy.referralCode(), 224, "!default");
 
         vm.expectRevert("!management");
         vm.prank(user);
