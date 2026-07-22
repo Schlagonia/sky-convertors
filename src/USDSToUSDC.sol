@@ -25,6 +25,8 @@ contract USDSToUSDC is BaseHealthCheck {
         require(IERC4626(_vault).asset() == USDC, "!vault asset");
         VAULT = _vault;
 
+        allowed[address(this)] = true;
+
         asset.forceApprove(LITE_PSM_WRAPPER, type(uint256).max);
         ERC20(USDC).forceApprove(LITE_PSM_WRAPPER, type(uint256).max);
         ERC20(USDC).forceApprove(VAULT, type(uint256).max);
@@ -68,9 +70,9 @@ contract USDSToUSDC is BaseHealthCheck {
 
     function _harvestAndReport() internal override returns (uint256) {
         if (!TokenizedStrategy.isShutdown()) {
-            uint256 looseAsset = asset.balanceOf(address(this));
-            if (looseAsset != 0) {
-                _deployFunds(looseAsset);
+            uint256 toDeploy = _min(asset.balanceOf(address(this)), availableDepositLimit(address(this)));
+            if (toDeploy != 0) {
+                _deployFunds(toDeploy);
             }
         }
 
@@ -125,5 +127,15 @@ contract USDSToUSDC is BaseHealthCheck {
 
     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a < b ? a : b;
+    }
+
+    function manualRedeem(uint256 _shares) external onlyManagement returns (uint256) {
+        _shares = _min(_shares, IERC4626(VAULT).maxRedeem(address(this)));
+        if (_shares == 0) return 0;
+        return IERC4626(VAULT).redeem(_shares, address(this), address(this));
+    }
+
+    function manualPsmSwap(uint256 _gemAmount) external onlyManagement returns (uint256) {
+        return ILitePSMWrapper(LITE_PSM_WRAPPER).sellGem(address(this), _gemAmount);
     }
 }

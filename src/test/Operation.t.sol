@@ -3,6 +3,9 @@ pragma solidity ^0.8.18;
 
 import {Setup, IHealthCheck, IStrategyInterface} from "./utils/Setup.sol";
 
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
 import {DAIToUSDC} from "../DAIToUSDC.sol";
 import {USDCToSUSDS} from "../USDCToSUSDS.sol";
 import {USDCToUSDS} from "../USDCToUSDS.sol";
@@ -63,6 +66,51 @@ abstract contract ConverterBehaviorTest is Setup {
         vm.mockCall(PSM, abi.encodeWithSelector(IPSM.tout.selector), abi.encode(1));
 
         assertEq(strategy.availableDepositLimit(user), 0, "!feeDepositLimit");
+    }
+
+    function test_manualRedeemAndPsmSwap() public {
+        mintAndDepositIntoStrategy(strategy, user, 1_000 * 10 ** asset.decimals());
+
+        IERC4626 strategyVault = IERC4626(strategy.VAULT());
+        ERC20 vaultAsset = ERC20(strategyVault.asset());
+        uint256 shares = strategyVault.maxRedeem(address(strategy));
+        assertGt(shares, 0, "!vaultShares");
+
+        vm.prank(user);
+        vm.expectRevert("!management");
+        strategy.manualRedeem(shares);
+
+        uint256 looseBefore = vaultAsset.balanceOf(address(strategy));
+        vm.prank(management);
+        uint256 redeemed = strategy.manualRedeem(type(uint256).max);
+
+        assertGt(redeemed, 0, "!redeemed");
+        assertEq(vaultAsset.balanceOf(address(strategy)), looseBefore + redeemed, "!looseVaultAsset");
+
+        uint256 gemAmount = 100e6;
+        vm.prank(user);
+        vm.expectRevert("!management");
+        strategy.manualPsmSwap(gemAmount);
+
+        if (address(asset) == USDC) {
+            uint256 usdcBefore = usdc.balanceOf(address(strategy));
+            uint256 usdsBefore = usds.balanceOf(address(strategy));
+
+            vm.prank(management);
+            uint256 usdsIn = strategy.manualPsmSwap(gemAmount);
+
+            assertEq(usdc.balanceOf(address(strategy)), usdcBefore + gemAmount, "!usdcOut");
+            assertEq(usds.balanceOf(address(strategy)), usdsBefore - usdsIn, "!usdsIn");
+        } else {
+            uint256 usdcBefore = usdc.balanceOf(address(strategy));
+            uint256 usdsBefore = usds.balanceOf(address(strategy));
+
+            vm.prank(management);
+            uint256 usdsOut = strategy.manualPsmSwap(gemAmount);
+
+            assertEq(usdc.balanceOf(address(strategy)), usdcBefore - gemAmount, "!usdcIn");
+            assertEq(usds.balanceOf(address(strategy)), usdsBefore + usdsOut, "!usdsOut");
+        }
     }
 
     function test_liveAccountingWithoutReport(uint256 amount, uint16 profitBps) public {
